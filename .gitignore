@@ -1,0 +1,33 @@
+# secrets and local config
+.env
+.env.*
+!.env.example
+
+# data, media, models and outputs (never commit)
+/data/*
+!/data/README.md
+/models/
+/outputs/
+*.npz
+*.npy
+*.pt
+*.pkl
+*.png
+*.jpg
+*.jpeg
+*.wav
+*.db
+*.sqlite
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
