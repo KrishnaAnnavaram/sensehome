@@ -9,7 +9,7 @@
 ![Modalities](https://img.shields.io/badge/Modalities-4-1F3864?style=for-the-badge)
 ![Models](https://img.shields.io/badge/Models-5_%2B_ablations-2E5FD9?style=for-the-badge)
 ![Recall@10](https://img.shields.io/badge/Recall%4010-0.208_synthetic-6E86E8?style=for-the-badge)
-![Tests](https://img.shields.io/badge/Tests-31_passing-3DA35B?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-30_passing-3DA35B?style=for-the-badge)
 ![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
@@ -106,7 +106,7 @@ sensehome gives each of these questions its own component. Each component has ty
 | Providers | CLIP image encoder and a PyTorch two-tower model. Both are optional |
 | Offline mode | Synthetic catalogue, synthetic media, all NumPy models and the evaluation. No download |
 | Safety | No interaction without a catalogue item. No test event earlier than a train event of the same user |
-| Tests | **31** unit tests (`pytest`). In CI, 30 pass and 1 skips (PyTorch is not in the `dev` extra) |
+| Tests | **30** pass in CI (`.[dev]` only) and 1 skips (`torch` extra). With the `torch` extra, all 31 pass |
 
 ```mermaid
 flowchart LR
@@ -152,7 +152,7 @@ sensehome/
 ├── data/README.md             # schemas, sources and licences (data files are git-ignored)
 ├── docs/ste-style-guide.md    # writing rules and project vocabulary
 ├── src/sensehome/             # the 11 modules in 2.1
-├── tests/                     # 31 unit tests, synthetic data only
+├── tests/                     # 31 unit tests (1 needs the torch extra), synthetic data only
 ├── .env.example               # variable names only
 └── pyproject.toml             # core deps: numpy, pydantic. Extras: media, clip, torch, dev
 ```
@@ -415,7 +415,7 @@ All numbers come from synthetic data. They show that the pipeline and the evalua
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **31 passed** (local). Expected CI: 30 passed, 1 skipped (PyTorch) | `pytest -q` |
+| Unit tests | CI installs only `.[dev]`: **30 passed**, 1 skipped (`torch` extra). With the extras: 31 passed | `pytest -q` |
 
 **One run (seed 7): 240 items, 300 users, 4,713 train events, 300 test users, K = 10**
 
@@ -449,10 +449,10 @@ All numbers come from synthetic data. They show that the pipeline and the evalua
 What the numbers show:
 
 - Each sense alone beats popularity, except `sound`. Its items are only 58 % of the catalogue.
-- Removing `sound` does not lower the result. This agrees with the rebuild plan: drop a sense that does not add value.
+- The run without `sound` is not worse than the run with all four senses. A sense that does not add value can be removed.
 - The modality attention model is 0.007 better than concatenation on the 5-seed mean. The difference is smaller than the spread, so it is not proven.
 - Item features improve BPR a little (0.142 against 0.129). The content models are better on this small, sparse data.
-- The prototype had random labels, so its accuracy (about 50 %) had no meaning. There is no prototype result to compare.
+- The earlier prototype reported an accuracy of about 50 % with random labels. That is a prototype result, not reproduced here, and it had no meaning.
 
 ---
 
@@ -480,7 +480,7 @@ Read these problems before you use sensehome in production.
 3. **The split is temporal and checked.** The feature pipeline is fit on train items only.
 4. **Ablations decide which senses stay.** On synthetic data, the tap sound adds nothing.
 5. **The attention is real.** It is learned with BPR and it can ignore a noise modality, as a test shows.
-6. **Everything runs offline.** The demo and the 31 tests need no download and no key.
+6. **Everything runs offline.** The demo and the 30 CI tests need no download and no key.
 
 ---
 
