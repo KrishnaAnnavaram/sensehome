@@ -70,6 +70,7 @@ This README is the **one location that explains all of sensehome**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one recommendation](#42-the-life-cycle-of-one-recommendation)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The catalogue, the interactions and the split](#5-the-catalogue-the-interactions-and-the-split)
 6. 🟢 [The encoders and the feature pipeline](#6-the-encoders-and-the-feature-pipeline)
 7. 🟣 [The recommenders](#7-the-recommenders)
@@ -133,6 +134,46 @@ flowchart LR
 | Evaluation | `src/sensehome/evaluate.py` | The suite: baselines, single-sense models, fusion, ablations |
 | CLI | `src/sensehome/cli.py` | The `sensehome` command with 5 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>sensehome command"]
+    CFG["config.py<br/>Settings"]
+    subgraph DATA["Data"]
+        SCH["schemas.py<br/>Item, Interaction, Dataset"]
+        SYN["synthetic.py<br/>make_dataset"]
+        SPL["split.py<br/>temporal_user_split"]
+    end
+    subgraph FEAT["Features"]
+        MED["media.py<br/>MediaSource"]
+        ENC["encoders.py<br/>FeaturePipeline"]
+    end
+    subgraph RANK["Ranking and evaluation"]
+        MOD["models.py<br/>Popularity, ContentProfile,<br/>ModalityAttention, FeatureBPR"]
+        TT["torch_models.py<br/>TwoTowerAttention, extra torch"]
+        EVA["evaluate.py<br/>run_suite"]
+        MET["metrics.py<br/>recall, ndcg, hit, bootstrap"]
+    end
+
+    CLI --> CFG
+    CLI --> SCH
+    CLI --> SYN
+    CLI --> ENC
+    CLI --> MOD
+    CLI --> EVA
+    CLI -- "--torch" --> TT
+    EVA --> SPL
+    EVA --> ENC
+    EVA --> MOD
+    EVA --> MET
+    ENC --> MED
+    MED --> SYN
+    SYN --> SCH
+    SPL --> SCH
+    TT --> MOD
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -170,6 +211,21 @@ The target of the model is the set of items that a user interacted with later in
 ### 3.3 No leakage from the future
 `temporal_user_split` keeps the last 20 % of each user's events for test. `Split.check` fails if a test item is in the same user's train history. The feature pipeline is fit on the items of the train events only.
 
+```mermaid
+flowchart LR
+    EV[/"Interactions"/] --> SPL["temporal_user_split"]
+    SPL --> TR["Train events:<br/>earlier events of each user"]
+    SPL --> TE["Test items:<br/>last 20 % of each user"]
+    SPL --> CHK{"Split.check:<br/>test item in train history,<br/>or train event after the cut?"}
+    CHK -- "yes" --> ERR[/"AssertionError: leakage"/]
+    TR --> ITEMS["Items of the<br/>train events"]
+    ITEMS --> FIT["FeaturePipeline.fit:<br/>text vocabulary, IDF,<br/>mean and SD"]
+    TR --> MOD["Model fit"]
+    FIT --> MOD
+    TE --> SCORE["Metrics only"]
+    MOD --> SCORE
+```
+
 ### 3.4 A missing sense is neutral
 Each modality has a mask. An item without a sound gets a modality score of 0 for `sound`. The attention softmax leaves out a modality that a user profile does not have.
 
@@ -189,13 +245,15 @@ The core needs only NumPy and Pydantic. PyTorch, CLIP, Pillow and soundfile load
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    C["catalogue.json"] --> V["Validate schemas and ids"]
-    I["interactions.csv"] --> V
-    V --> S["Temporal split per user"]
+flowchart TD
+    C[/"catalogue.json"/] --> V{"Schemas valid, item ids unique,<br/>each interaction names a known item?"}
+    I[/"interactions.csv"/] --> V
+    V -- "no" --> INV[/"ValueError:<br/>validate prints INVALID, exit code 1"/]
+    V -- "yes" --> S["Temporal split per user"]
     S --> TR["Train events"]
     S --> TE["Test items"]
-    TR --> FP["Fit feature pipeline on train items"]
+    MEDIA[("Photos and tap sounds:<br/>files or synthetic references")] --> FP
+    TR --> FP["Fit feature pipeline<br/>on train items"]
     FP --> E1["look: photo statistics"]
     FP --> E2["feel: tags"]
     FP --> E3["text: TF-IDF"]
@@ -204,13 +262,43 @@ flowchart TB
     E2 --> P
     E3 --> P
     E4 --> P
-    P --> A["Modality attention (BPR on a validation item)"]
-    A --> R["Rank items, without train items"]
-    R --> M["Recall@K, NDCG@K, Hit@K, coverage"]
+    P --> A["Modality attention<br/>BPR on a validation item"]
+    A --> R["Rank items,<br/>without train items"]
+    R --> M[/"Recall@K, NDCG@K, Hit@K, coverage,<br/>with baselines and ablations"/]
     TE --> M
+    R -- "train command:<br/>fit on all events" --> OUT[("models/recommendations.json<br/>top-K list for each user")]
+    M --> HUMAN{{"HUMAN<br/>reads the ablation table,<br/>checks coverage before a launch"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one recommendation
+
+```mermaid
+stateDiagram-v2
+    state "Events of one user" as Events
+    state "First event of each item" as Deduped
+    state "Train only, no test items" as TrainOnly
+    state "Train events and test items" as Split
+    state "Profile for each modality" as Profiled
+    state "Modality scores of all items" as Scored
+    state "Fused score of all items" as Fused
+    state "Top-K list" as TopK
+    [*] --> Events: load and validate
+    Events --> Deduped: _dedupe_first, sort by time
+    Deduped --> TrainOnly: fewer than 3 train events would remain
+    Deduped --> Split: last 20 percent to test
+    TrainOnly --> Profiled: weighted mean of item vectors
+    Split --> Profiled: weighted mean of train item vectors
+    Profiled --> Scored: similarity, z-score, 0 if no modality
+    Scored --> Fused: attention weights or equal weights
+    Fused --> TopK: remove train items, keep K
+    TopK --> Evaluated: user has test items
+    TopK --> Explained: recommend command
+    Evaluated --> [*]
+    Explained --> [*]
+```
 
 1. Load and validate the catalogue and the interactions.
 2. Split the events of each user by time.
@@ -222,11 +310,59 @@ flowchart TB
 8. Remove the user's train items and keep the top K items.
 9. Show the weights and the modality scores as the explanation.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Analyst
+    participant CLI as sensehome CLI
+    participant SCH as schemas.load_dataset
+    participant SPL as split.temporal_user_split
+    participant FP as FeaturePipeline
+    participant MOD as Recommender
+    participant MET as metrics
+
+    A->>CLI: sensehome evaluate --data data/synthetic
+    CLI->>CLI: Settings.from_env
+    CLI->>SCH: load catalogue.json and interactions.csv
+    SCH-->>CLI: Dataset, ids checked
+    CLI->>SPL: run_suite, prepare(ds)
+    SPL-->>CLI: Split, leakage checked
+    CLI->>FP: fit(train items), transform(all items)
+    FP-->>CLI: ModalityMatrix X and mask for each sense
+    loop each model: baselines, single senses, fusion, ablations, BPR
+        CLI->>MOD: fit(TrainData, features)
+        CLI->>MOD: recommend(user, K, exclude train items)
+        MOD-->>CLI: top-K item positions
+        CLI->>MET: recall_at_k, ndcg_at_k, hit_at_k, bootstrap_mean_ci
+        MET-->>CLI: Row with intervals and coverage
+    end
+    CLI-->>A: result table, or JSON with --json
+```
+
 ---
 
 ## 5. The catalogue, the interactions and the split
 
 **Purpose.** Give the models clean, aligned data and a split without leakage.
+
+```mermaid
+flowchart TD
+    CAT[/"catalogue.json"/] --> IT{"Each item passes Item:<br/>category, materials, textures,<br/>licence, no extra field?"}
+    INT[/"interactions.csv"/] --> COL{"Columns user_id, item_id,<br/>timestamp, event present?"}
+    IT -- "no" --> ERR[/"ValueError"/]
+    COL -- "no" --> ERR
+    COL -- "yes" --> IA{"Each row passes Interaction:<br/>timestamp 0 or more,<br/>view, save or purchase?"}
+    IA -- "no" --> ERR
+    IT -- "yes" --> DS["Dataset"]
+    IA -- "yes" --> DS
+    DS --> DUP{"Duplicate item_id?"}
+    DUP -- "yes" --> ERR
+    DUP -- "no" --> UNK{"Interaction names an<br/>item not in the catalogue?"}
+    UNK -- "yes" --> ERR
+    UNK -- "no" --> OK[/"Dataset with item index<br/>and coverage_report"/]
+```
 
 | Input | Output |
 |---|---|
@@ -241,6 +377,22 @@ flowchart TB
 5. Sort each user's events by time and keep the last 20 % (minimum 1) for test.
 6. If fewer than 3 train events remain for a user, keep all events of that user in train.
 
+The diagram shows how `temporal_user_split()` treats the events of one user.
+
+```mermaid
+flowchart TD
+    IN[/"All interactions"/] --> DD["_dedupe_first: sort by user, time, item.<br/>Keep the first event of each user and item"]
+    DD --> GRP["Group the events by user"]
+    GRP --> NT["n_test = max of 1 and<br/>round of 20 % of the events"]
+    NT --> SH{"Events minus n_test<br/>fewer than 3?"}
+    SH -- "yes" --> TRO["All events to train,<br/>no test items"]
+    SH -- "no" --> CUT["Earlier events to train,<br/>last n_test items to test"]
+    TRO --> CHK{"Split.check: a test item in<br/>train, or a train event<br/>after the test cut?"}
+    CUT --> CHK
+    CHK -- "yes" --> LEAK[/"AssertionError: leakage"/]
+    CHK -- "no" --> OUT[/"Split: train events,<br/>test items for each user"/]
+```
+
 **The synthetic data**
 
 | Part | How it is made |
@@ -252,11 +404,38 @@ flowchart TB
 | Users | 300 users with hidden style, colour, texture and material tastes and a hidden look-or-feel weight |
 | Events | About 20 for each user, chosen with a softmax (temperature 0.15) of the user's utility |
 
+```mermaid
+flowchart LR
+    SEED[/"seed, 240 items, 300 users"/] --> ITM["make_items: hidden style and colour,<br/>material and texture, category"]
+    ITM --> REF["image = synthetic reference.<br/>sound = synthetic reference<br/>for about 60 % of items"]
+    ITM --> TXT["Title and description from<br/>style words, colour, material"]
+    REF --> MED["render_image: 24 × 24 RGB.<br/>render_sound: 0.25 s at 8 kHz"]
+    ITM --> USR["make_interactions: hidden tastes<br/>and look-or-feel weight for each user"]
+    USR --> UT["Utility of each item<br/>+ Gumbel noise, temperature 0.15"]
+    UT --> PICK["Top n items, n near 20,<br/>random event times"]
+    PICK --> EVT["Event: view 70 %,<br/>save 20 %, purchase 10 %"]
+    EVT --> DS[/"Dataset: catalogue.json,<br/>interactions.csv"/]
+    TXT --> DS
+```
+
 ---
 
 ## 6. The encoders and the feature pipeline
 
 **Purpose.** Change each sense of an item into a vector, with the state fit on train items only.
+
+```mermaid
+flowchart LR
+    IT[/"One item"/] --> MS["MediaSource:<br/>file, synthetic reference or none"]
+    MS --> LK["look: ImageStatsEncoder<br/>histogram, mean colour,<br/>gradients, FFT bands"]
+    IT --> FL["feel: TagEncoder<br/>multi-hot materials<br/>and textures"]
+    IT --> TX["text: TextTfidfEncoder<br/>title and description"]
+    MS --> SD["sound: SoundBandEncoder<br/>16 band energies,<br/>centroid, decay"]
+    LK --> RAW[/"Raw vector,<br/>or None if the sense is absent"/]
+    FL --> RAW
+    TX --> RAW
+    SD --> RAW
+```
 
 | Modality | Offline encoder | Dimensions | Optional encoder |
 |---|---|---|---|
@@ -272,11 +451,45 @@ flowchart TB
 3. For each item, encode each modality, standardise it and scale it to unit length.
 4. If the item does not have the modality, store a zero row and set the mask to false.
 
+```mermaid
+flowchart TD
+    TRI[/"Train items"/] --> FIT["For each encoder:<br/>fit, then raw of each train item"]
+    FIT --> ANY{"A train item has<br/>this modality?"}
+    ANY -- "no" --> ERR[/"ValueError"/]
+    ANY -- "yes" --> ST[("stats: mean and SD + 1e-6<br/>for each modality")]
+    ALL[/"All catalogue items"/] --> RAW["raw vector of each item"]
+    RAW --> HAS{"Vector present?"}
+    HAS -- "no" --> ZERO["Zero row, mask false"]
+    HAS -- "yes" --> Z["z = raw minus mean,<br/>divided by SD"]
+    ST --> Z
+    Z --> NORM["Scale to unit length,<br/>mask true"]
+    ZERO --> OUT[/"ModalityMatrix X and mask<br/>for each modality"/]
+    NORM --> OUT
+```
+
 ---
 
 ## 7. The recommenders
 
 **Purpose.** Rank the items for each user.
+
+The diagram shows how `ContentProfile` and `ModalityAttention` score and rank the items for one user.
+
+```mermaid
+flowchart LR
+    TR[/"User train items<br/>and event weights"/] --> PROF["_profiles: weighted mean<br/>of item vectors, for each modality"]
+    PROF --> CONS["Consistency =<br/>length of each profile"]
+    PROF --> SIM["Similarity of each item<br/>to the profile"]
+    SIM --> ZS["z-score over items with<br/>the modality, 0 if absent"]
+    CONS --> W{"Model"}
+    W -- "content" --> EQ["Equal weights"]
+    W -- "attention" --> AT["softmax of theta + beta × consistency,<br/>modalities with no profile left out"]
+    ZS --> SUM["Weighted sum of<br/>modality scores"]
+    EQ --> SUM
+    AT --> SUM
+    SUM --> EXC["recommend: train items<br/>set to minus infinity"]
+    EXC --> TOP[/"Top K items"/]
+```
 
 | Model | Idea | Learned parameters |
 |---|---|---|
@@ -294,6 +507,55 @@ flowchart TB
 3. For each user, pair the validation item with 20 sampled items that the user did not see.
 4. Do 200 steps of gradient ascent on the BPR log-likelihood for θ and β (learning rate 0.5).
 5. Make the final profiles from all train items.
+
+```mermaid
+flowchart TD
+    TD1[/"TrainData"/] --> HOLD{"User has 2 or<br/>more train items?"}
+    HOLD -- "yes" --> VAL["Last train item = validation item.<br/>Inner profiles from the other items"]
+    HOLD -- "no" --> NOV["No validation item,<br/>all items in the profile"]
+    VAL --> NEG["Draw 20 items, remove items<br/>in the inner history"]
+    NEG --> PAIRS["Pairs: modality scores of the<br/>validation item and of each negative"]
+    PAIRS --> STEP["One step: alpha = softmax,<br/>x = alpha · score difference"]
+    STEP --> GRAD["theta and beta += 0.5 ×<br/>mean BPR gradient"]
+    GRAD --> MORE{"200 steps done?"}
+    MORE -- "no" --> STEP
+    MORE -- "yes" --> FIN["ContentProfile.fit:<br/>final profiles from all train items"]
+    NOV --> FIN
+    FIN --> OUT[/"theta, beta, profiles"/]
+```
+
+`FeatureBPR` learns the user and item vectors with sampled negatives.
+
+```mermaid
+flowchart TD
+    IN[/"Train pairs: user, item"/] --> FEAT{"use_features?"}
+    FEAT -- "yes, bpr+features" --> F["F = all modality matrices,<br/>side by side"]
+    FEAT -- "no, bpr" --> F0["F = one zero column"]
+    F --> INIT["Random P, E, W, bias 0"]
+    F0 --> INIT
+    INIT --> EP["Each epoch: shuffle the pairs,<br/>batches of 256"]
+    EP --> NEG["Negative item j for each pair.<br/>Draw again if the user saw it, 10 tries"]
+    NEG --> Q["Item vector q = E + F × W"]
+    Q --> UPD["BPR gradient step, learning rate 0.05,<br/>L2 1e-4, on P, E, W and bias"]
+    UPD --> DONE{"30 epochs done?"}
+    DONE -- "no" --> EP
+    DONE -- "yes" --> OUT[/"Score = Q · P of user + bias"/]
+```
+
+`TwoTowerAttention` (extra `torch`) learns the fusion inside the item tower.
+
+```mermaid
+flowchart LR
+    X[/"ModalityMatrix X and mask<br/>of each modality"/] --> PROJ["Linear projection<br/>for each modality, dim 32"]
+    PROJ --> ATT["Additive attention:<br/>v · tanh of W h"]
+    X --> MASK["Absent modality<br/>set to minus infinity"]
+    MASK --> ATT
+    ATT --> SM["softmax over<br/>the modalities"]
+    SM --> ITEM["Item vector = weighted sum<br/>+ item id vector"]
+    USR["User id vector"] --> LOSS["BPR loss with<br/>sampled negatives, Adam"]
+    ITEM --> LOSS
+    LOSS --> OUT[/"Score = item vector ·<br/>user vector"/]
+```
 
 **Rules**
 
@@ -325,6 +587,23 @@ flowchart TB
 | NDCG@K | Discounted gain of the test items in the top K, divided by the best possible gain |
 | Hit@K | Share of users with at least one test item in the top K |
 | Coverage | Share of catalogue items that are in at least one top-K list |
+
+The diagram shows how `evaluate_model()` makes one row of the result table.
+
+```mermaid
+flowchart LR
+    TU[/"Test users, sorted"/] --> IN{"User has<br/>train events?"}
+    IN -- "no" --> SKIP["Skip the user"]
+    IN -- "yes" --> REC["recommend: top K,<br/>train items removed"]
+    REC --> M["recall_at_k, ndcg_at_k,<br/>hit_at_k for the user"]
+    REC --> SH["Add the K items to<br/>the shown set"]
+    M --> MEAN["Mean over users"]
+    M --> BOOT["bootstrap_mean_ci:<br/>1000 samples, 95 %"]
+    SH --> COV["coverage = shown items /<br/>catalogue items"]
+    MEAN --> ROW[/"Row: model, users, recall, NDCG,<br/>intervals, hit, coverage"/]
+    BOOT --> ROW
+    COV --> ROW
+```
 
 ---
 
@@ -383,6 +662,35 @@ sensehome validate --data data/myshop
 sensehome evaluate --data data/myshop
 ```
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> GEN["sensehome generate"]
+    GEN --> DAT[("data/synthetic/<br/>catalogue.json, interactions.csv")]
+    DAT --> VAL["sensehome validate"]
+    DAT --> EV["sensehome evaluate"]
+    INS --> SEEDS["sensehome evaluate --seeds<br/>new synthetic data for each seed"]
+    DAT --> TRN["sensehome train"]
+    TRN --> OUT[("models/recommendations.json")]
+    DAT --> REC["sensehome recommend --user"]
+    TORCH["pip install -e .[torch]"] --> EVT["sensehome evaluate --torch"]
+    DAT --> EVT
+```
+
+Each command except `generate` finds its data in this sequence:
+
+```mermaid
+flowchart TD
+    ARG[/"--data folder<br/>default SENSEHOME_DATA_DIR"/] --> HAS{"Folder has<br/>catalogue.json?"}
+    HAS -- "yes" --> LOAD["load_dataset:<br/>catalogue.json and interactions.csv"]
+    HAS -- "no" --> DEF{"Folder is the<br/>default data folder?"}
+    DEF -- "yes" --> SYN["make_dataset in memory,<br/>with --seed"]
+    DEF -- "no" --> STOP[/"Stop: no catalogue.json in the folder"/]
+    LOAD --> DS[/"Dataset"/]
+    SYN --> DS
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -391,7 +699,7 @@ sensehome evaluate --data data/myshop
 | `SENSEHOME_MODEL_DIR` | `train` | Output folder, default `models` |
 | `SENSEHOME_SEED` | all | Random seed, default 7 |
 | `SENSEHOME_K` | `evaluate`, `train`, `recommend` | List length, default 10 |
-| `SENSEHOME_IMAGE_ENCODER` | settings | `histogram` (default) or `clip` |
+| `SENSEHOME_IMAGE_ENCODER` | settings | `histogram` (default) or `clip`. The settings check the value, but no command uses it. To use CLIP, see [11](#11-how-to-extend-sensehome) |
 
 sensehome needs no API key. Local settings are only in a `.env` file. Git ignores this file.
 
@@ -467,7 +775,7 @@ Read these problems before you use sensehome in production.
 | 3 | Attention | The gain over concatenation is small and not significant | Keep concatenation as the default comparison in each report |
 | 4 | Two-tower | The PyTorch model is not tuned and is below the content models | Tune it on real data, or use it only for large catalogues |
 | 5 | Sound | Few real products have a recorded sound | Leave `sound` empty when there is no real recording |
-| 6 | Cold start | New users with fewer than 3 events get no test split and no profile | Use popularity for new users |
+| 6 | Cold start | Users with fewer than 4 events get no test items, so the evaluation does not measure them. A new user with no event gets no profile | Use popularity for new users |
 | 7 | Encoders | The offline photo encoder sees only colour and simple texture statistics | Use CLIP (extra `clip`) for real photos |
 | 8 | Bias | Popularity and content models repeat the past taste of a user | Check coverage and diversity before a launch |
 
